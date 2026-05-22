@@ -1,69 +1,251 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Token Guard Dashboard</title>
-    <style>
-        body { font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: auto; }
-        textarea { width: 100%; height: 100px; margin-bottom: 10px; padding: 8px; }
-        button { padding: 10px 15px; font-weight: bold; cursor: pointer; }
-        #output { margin-top: 20px; padding: 15px; background: #f9f9f9; border-left: 4px solid #007bff; }
-        .highlight { color: #28a745; font-weight: bold; }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Token Guard Agent</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+<div class="container">
 
-    <h2>🛡️ Token Guard Dashboard</h2>
-    <p>Simulate sending traffic to the AI API:</p>
-    
-    <textarea id="promptInput" placeholder="Paste a very long paragraph here..."></textarea>
-    <button onclick="sendTraffic()">Send Traffic Through Guard</button>
+  <header>
+    <span style="font-size:1.5rem">🛡️</span>
+    <h1>Token Guard <span>Agent</span></h1>
+    <span class="version-badge">v2 — Agentic</span>
+  </header>
 
-    <div id="output">Waiting for traffic...</div>
+  <!-- Input -->
+  <div class="card">
+    <div class="card-label">Prompt Input</div>
+    <textarea id="promptInput" placeholder="Paste a prompt here — the agent will analyze, decide, and act…"></textarea>
+    <div class="btn-row">
+      <button id="sendBtn" onclick="sendToAgent()">▶ Run Agent</button>
+      <button class="btn-ghost" onclick="document.getElementById('promptInput').value=''">Clear</button>
+    </div>
+  </div>
 
-    <script>
-        async function sendTraffic() {
-            const input = document.getElementById('promptInput').value;
-            const outputBox = document.getElementById('output');
+  <!-- Result -->
+  <div class="card" id="resultCard">
+    <div class="card-label">Agent Decision</div>
+    <div id="resultInner"></div>
+  </div>
 
-            if (!input) {
-                outputBox.innerHTML = "⚠️ Please enter some text.";
-                return;
-            }
+  <!-- Agent Trace -->
+  <div class="card" id="traceCard">
+    <div class="card-label">🧠 Agent Reasoning Trace</div>
+    <div class="trace-chain" id="traceChain"></div>
+  </div>
 
-            outputBox.innerHTML = "⏳ Analyzing prompt...";
+  <!-- Session History -->
+  <div class="section-header">
+    <span class="section-title">📊 Session History <span id="historyCount">0</span></span>
+    <button class="btn-ghost" style="font-size:.75rem;padding:4px 10px;border:1px solid #1e2235" onclick="clearHistory()">Clear</button>
+  </div>
+  <div id="historyWrap">
+    <div class="empty-state">No requests yet — run the agent to get started.</div>
+  </div>
 
-            try {
-                const response = await fetch('/guard', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: input })
-                });
+</div>
 
-                const data = await response.json();
+<script>
+  const TOOL_META = {
+    analyze_prompt:  { icon: '🔍', label: 'analyze_prompt',  dotClass: 'dot-analyze',  nameClass: 'tool-analyze'  },
+    optimize_prompt: { icon: '✂️', label: 'optimize_prompt', dotClass: 'dot-optimize', nameClass: 'tool-optimize' },
+    approve_prompt:  { icon: '✅', label: 'approve_prompt',  dotClass: 'dot-approve',  nameClass: 'tool-approve'  },
+    flag_prompt:     { icon: '🚩', label: 'flag_prompt',     dotClass: 'dot-flag',     nameClass: 'tool-flag'     },
+  };
 
-                if (data.status === "optimized") {
-                    outputBox.innerHTML = `
-                        <strong>Status:</strong> ⚠️ Bloat Detected & Optimized<br><br>
-                        <strong>Original Length:</strong> ${data.original_length} characters<br>
-                        <strong>New Length:</strong> ${data.new_length} characters<br>
-                        <strong>Money Saved:</strong> <span class="highlight">${data.savings_percent}% less tokens used!</span><br><br>
-                        <strong>Optimized Prompt Sent to API:</strong><br>
-                        <em>"${data.final_prompt}"</em>
-                    `;
-                } else if (data.status === "passed") {
-                    outputBox.innerHTML = `
-                        <strong>Status:</strong> <span class="highlight">✅ Efficient</span><br><br>
-                        Prompt was short enough. Passed directly to API without changes.
-                    `;
-                } else {
-                    outputBox.innerHTML = "❌ Error processing request.";
-                }
-            } catch (error) {
-                outputBox.innerHTML = "❌ Connection failed. Is the server running?";
-            }
-        }
-    </script>
+  const ACTION_BADGE = {
+    optimize_prompt: '<span class="badge badge-optimize">Optimized</span>',
+    approve_prompt:  '<span class="badge badge-approve">Approved</span>',
+    flag_prompt:     '<span class="badge badge-flag">Flagged</span>',
+  };
+
+  async function sendToAgent() {
+    const input   = document.getElementById('promptInput').value.trim();
+    const btn     = document.getElementById('sendBtn');
+    const resCard = document.getElementById('resultCard');
+    const traCard = document.getElementById('traceCard');
+
+    if (!input) { alert('Please enter a prompt.'); return; }
+
+    btn.disabled      = true;
+    btn.innerHTML     = '<span class="pulse"></span> Agent thinking…';
+    resCard.style.display = 'none';
+    traCard.style.display = 'none';
+
+    try {
+      const res  = await fetch('/guard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: input })
+      });
+      const data = await res.json();
+
+      renderResult(data);
+      renderTrace(data.agent_steps || []);
+      resCard.style.display = 'block';
+      traCard.style.display = 'block';
+      await loadHistory();
+    } catch (err) {
+      resCard.style.display  = 'block';
+      document.getElementById('resultInner').innerHTML =
+        '<span style="color:#f87171">❌ Could not reach agent. Is the server running?</span>';
+    } finally {
+      btn.disabled  = false;
+      btn.innerHTML = '▶ Run Agent';
+    }
+  }
+
+  function renderResult(d) {
+    const action  = d.status;
+    const savings = parseFloat(d.savings_percent) > 0;
+    const badge   = ACTION_BADGE[action] || `<span class="badge badge-unknown">${action}</span>`;
+
+    let html = `<div class="result-status">${badge}</div>`;
+    html += `<div class="stat-row">`;
+    html += `<div class="stat"><div class="label">Original</div><div class="val">${d.original_length} chars</div></div>`;
+    html += `<div class="stat"><div class="label">New</div><div class="val">${d.new_length} chars</div></div>`;
+    if (savings) {
+      html += `<div class="stat"><div class="label">Saved</div><div class="val savings">${d.savings_percent}%</div></div>`;
+    }
+    html += `</div>`;
+
+    if (action === 'optimize_prompt') {
+      html += `<div class="final-prompt-box">"${esc(d.final_prompt)}"</div>`;
+    }
+
+    if (d.flagged) {
+      html += `<div class="flag-box">
+        <div class="flag-title">🚩 Flagged — ${esc(d.flag_severity?.toUpperCase() || 'UNKNOWN')} severity</div>
+        <div class="flag-text">${esc(d.flag_issue || '')}</div>
+      </div>`;
+    }
+
+    document.getElementById('resultInner').innerHTML = html;
+  }
+
+  function renderTrace(steps) {
+    const chain = document.getElementById('traceChain');
+    if (!steps.length) { chain.innerHTML = '<span style="color:#4b5563;font-size:.83rem">No steps recorded.</span>'; return; }
+
+    chain.innerHTML = steps.map((step, i) => {
+      const meta = TOOL_META[step.tool] || { icon: '⚙️', label: step.tool, dotClass: '', nameClass: '' };
+      const isLast = i === steps.length - 1;
+      const pills  = buildPills(step.tool, step.output);
+
+      return `
+        <div class="trace-step">
+          <div class="step-line">
+            <div class="step-dot ${meta.dotClass}">${meta.icon}</div>
+            ${!isLast ? '<div class="step-connector"></div>' : ''}
+          </div>
+          <div class="step-body">
+            <div class="step-tool-name ${meta.nameClass}">Step ${step.step}: ${meta.label}</div>
+            <div class="step-kv">${pills}</div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function buildPills(tool, output) {
+    if (!output) return '';
+    const pills = [];
+
+    if (tool === 'analyze_prompt') {
+      pills.push(pill('length', output.length));
+      pills.push(pill('words', output.word_count));
+      pills.push(pill('repetition', output.has_repetition, true));
+      pills.push(pill('filler phrases', output.has_filler_phrases, true));
+      pills.push(pill('PII risk', output.has_potential_pii, true));
+      pills.push(pill('needs optimization', output.needs_optimization, true));
+      if (output.estimated_savings_pct > 0) pills.push(pill('est. savings', output.estimated_savings_pct + '%'));
+    } else if (tool === 'optimize_prompt') {
+      pills.push(pill('saved', output.savings_percent + '%'));
+      pills.push(pill('reason', output.reason?.slice(0, 40)));
+      pills.push(pill('new length', output.new_length + ' chars'));
+    } else if (tool === 'approve_prompt') {
+      pills.push(pill('reason', output.reason?.slice(0, 50)));
+    } else if (tool === 'flag_prompt') {
+      pills.push(pill('severity', output.severity));
+      pills.push(pill('issue', output.issue?.slice(0, 50)));
+    }
+
+    return pills.join('');
+  }
+
+  function pill(key, val, isBool = false) {
+    if (val === undefined || val === null) return '';
+    const cls = isBool ? (val ? 'kv-true' : 'kv-false') : '';
+    const display = isBool ? (val ? '✓ ' + key : key) : key;
+    return `<span class="kv-pill ${cls}"><strong>${esc(display)}</strong>${isBool ? '' : ': ' + esc(String(val))}</span>`;
+  }
+
+  async function loadHistory() {
+    try {
+      const res     = await fetch('/history');
+      const history = await res.json();
+      renderHistory(history);
+    } catch (e) { console.error(e); }
+  }
+
+  function renderHistory(history) {
+    document.getElementById('historyCount').textContent = history.length;
+    const wrap = document.getElementById('historyWrap');
+
+    if (!history.length) {
+      wrap.innerHTML = '<div class="empty-state">No requests yet — run the agent to get started.</div>';
+      return;
+    }
+
+    const rows = history.map(item => {
+      const time    = new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const savings = parseFloat(item.savings_percent) > 0
+        ? `<span class="savings-val">${item.savings_percent}%</span>`
+        : `<span class="savings-zero">—</span>`;
+      const badge = ACTION_BADGE[item.status]
+        || `<span class="badge badge-unknown">${item.status}</span>`;
+      const flag  = item.flagged ? ' 🚩' : '';
+
+      return `<tr>
+        <td class="td-time">${time}</td>
+        <td>${badge}${flag}</td>
+        <td class="td-preview" title="${esc(item.preview)}">${esc(item.preview)}</td>
+        <td class="td-num">${item.original_length}</td>
+        <td class="td-num">${item.new_length}</td>
+        <td class="td-savings">${savings}</td>
+        <td class="td-num" style="color:#818cf8">${item.steps_taken}</td>
+      </tr>`;
+    }).join('');
+
+    wrap.innerHTML = `
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Time</th><th>Action</th><th>Preview</th>
+            <th style="text-align:right">Original</th>
+            <th style="text-align:right">New</th>
+            <th style="text-align:right">Saved</th>
+            <th style="text-align:right">Steps</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  async function clearHistory() {
+    await fetch('/history', { method: 'DELETE' });
+    await loadHistory();
+  }
+
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  loadHistory();
+</script>
 </body>
 </html>
