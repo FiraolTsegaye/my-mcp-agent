@@ -1,392 +1,241 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Token Guard Agent v2
-// An autonomous AI agent that guards API token costs using:
-//   - Gemini function calling (multi-step tool use)
-//   - Phoenix/Arize OpenTelemetry tracing (partner integration)
-//   - Dynatrace Grail telemetry
-//   - Cloud Run ready Express server
+// Token Guard Agent v3 — Hackathon Edition
+// Powered by Gemini & Dynatrace MCP Server
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
 
-// ── Phoenix / OpenTelemetry — must initialise before anything else ────────────
-const { NodeSDK }            = require('@opentelemetry/sdk-node');
-const { OTLPTraceExporter }  = require('@opentelemetry/exporter-trace-otlp-http');
-const { Resource }           = require('@opentelemetry/resources');
-const { trace, SpanStatusCode, context } = require('@opentelemetry/api');
-
-const sdk = new NodeSDK({
-  resource: new Resource({ 'service.name': 'token-guard-agent', 'service.version': '2.0.0' }),
-  traceExporter: new OTLPTraceExporter({
-    url: process.env.PHOENIX_COLLECTOR_ENDPOINT || 'http://localhost:6006/v1/traces',
-  }),
-});
-
-sdk.start();
-console.log('🔭 Phoenix/Arize tracing initialised →', process.env.PHOENIX_COLLECTOR_ENDPOINT || 'http://localhost:6006');
-
-const tracer = trace.getTracer('token-guard-agent', '2.0.0');
-
-// ── Core dependencies ─────────────────────────────────────────────────────────
 const express                   = require('express');
 const path                      = require('path');
 const axios                     = require('axios');
 const { GoogleGenerativeAI }    = require('@google/generative-ai');
+const { Client }                = require('@modelcontextprotocol/sdk/client/index.js');
+const { SSEClientTransport }    = require('@modelcontextprotocol/sdk/client/sse.js');
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// ── Configuration ────────────────────────────────────────────────────────────
+const PORT             = process.env.PORT || 3000;
+const DT_ENV_URL       = process.env.DT_ENVIRONMENT_URL;
+const DT_TOKEN         = process.env.DT_PLATFORM_TOKEN;
+const GEMINI_KEY       = process.env.GEMINI_API_KEY;
 
-// ── Agent tool declarations (Gemini function calling) ─────────────────────────
-const AGENT_TOOLS = [{
-  functionDeclarations: [
-    {
-      name: 'analyze_prompt',
-      description: 'Analyze a prompt for length, repetition, filler phrases, and clarity. Always call this first before making any decision.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The prompt to analyze' }
-        },
-        required: ['prompt']
+// Remote MCP Endpoint for Dynatrace
+const DT_MCP_URL = `${DT_ENV_URL}/platform-reserved/mcp-gateway/v0.1/servers/dynatrace-mcp/mcp`;
+
+const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+const app   = express();
+app.use(express.json());
+
+// ── MCP Client Setup ─────────────────────────────────────────────────────────
+let mcpClient = null;
+let dynatraceTools = [];
+
+async function initMCP() {
+  try {
+    console.log(`🔌 Connecting to Dynatrace MCP at: ${DT_MCP_URL}`);
+    
+    const transport = new SSEClientTransport(new URL(DT_MCP_URL), {
+      eventSourceInit: {
+        headers: {
+          'Authorization': `Bearer ${DT_TOKEN}`
+        }
       }
-    },
-    {
-      name: 'optimize_prompt',
-      description: 'Rewrite a bloated or verbose prompt into the shortest possible form that preserves full intent. Use when analysis shows optimization is needed.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The prompt to rewrite' },
-          reason: { type: 'string', description: 'Why this prompt needs optimization (e.g. "too long", "repetitive", "filler phrases")' }
-        },
-        required: ['prompt', 'reason']
+    });
+
+    mcpClient = new Client({
+      name: "token-guard-agent",
+      version: "3.0.0"
+    }, {
+      capabilities: {
+        tools: {}
       }
-    },
-    {
-      name: 'approve_prompt',
-      description: 'Approve a prompt to pass through unchanged. Use when the prompt is already concise and well-formed.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt:  { type: 'string', description: 'The prompt being approved' },
-          reason:  { type: 'string', description: 'Why this prompt passes without changes' }
-        },
-        required: ['prompt', 'reason']
-      }
-    },
-    {
-      name: 'flag_prompt',
-      description: 'Flag a prompt as problematic without blocking it. Use when the prompt is ambiguous, contradictory, or contains potential data leakage patterns.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt:   { type: 'string', description: 'The prompt being flagged' },
-          issue:    { type: 'string', description: 'Description of the issue detected' },
-          severity: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Severity of the issue' }
-        },
-        required: ['prompt', 'issue', 'severity']
-      }
+    });
+
+    await mcpClient.connect(transport);
+    
+    // Discover available tools from Dynatrace
+    const toolsResult = await mcpClient.listTools();
+    dynatraceTools = toolsResult.tools || [];
+    
+    console.log(`✅ Connected to Dynatrace MCP. Discovered ${dynatraceTools.length} tools.`);
+    return true;
+  } catch (err) {
+    console.error('❌ Failed to connect to Dynatrace MCP:', err.message);
+    return false;
+  }
+}
+
+// ── Internal Agent Tools (Legacy + New) ──────────────────────────────────────
+const INTERNAL_TOOLS = [
+  {
+    name: 'analyze_prompt',
+    description: 'Analyze a prompt for length, repetition, filler phrases, and clarity.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The prompt to analyze' }
+      },
+      required: ['prompt']
     }
-  ]
-}];
-
-// Agent model (function calling enabled)
-const agentModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash', tools: AGENT_TOOLS });
-
-// Separate model for the actual prompt rewriting (no tools needed)
-const optimizerModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+  },
+  {
+    name: 'optimize_prompt',
+    description: 'Rewrite a bloated prompt into a concise form.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The prompt to rewrite' },
+        reason: { type: 'string', description: 'Reason for optimization' }
+      },
+      required: ['prompt', 'reason']
+    }
+  },
+  {
+    name: 'approve_prompt',
+    description: 'Approve a prompt without changes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string' },
+        reason: { type: 'string' }
+      },
+      required: ['prompt', 'reason']
+    }
+  }
+];
 
 // ── Tool Executors ────────────────────────────────────────────────────────────
 
-/**
- * analyze_prompt — rule-based, no extra LLM call, returns structured report
- */
-function analyzePrompt({ prompt }) {
-  const len         = prompt.length;
-  const words       = prompt.trim().split(/\s+/);
-  const wordCount   = words.length;
-  const sentences   = (prompt.match(/[.!?]+/g) || []).length || 1;
-  const avgWPS      = Math.round(wordCount / sentences);
+async function executeInternalTool(name, args) {
+  switch (name) {
+    case 'analyze_prompt':
+      const prompt = args.prompt;
+      const len = prompt.length;
+      const needsOpt = len > 100 || /\b(please|could you|i would like)\b/i.test(prompt);
+      return {
+        length: len,
+        needs_optimization: needsOpt,
+        estimated_savings: needsOpt ? '40%' : '0%'
+      };
 
-  const hasRepetition   = /(\b\w{4,}\b)(?:\s+\S+){0,8}\s+\1/i.test(prompt);
-  const hasFillerPhrases = /\b(please note that|it is important to|as you (may )?know|in order to|due to the fact that|for the purpose of|i would like you to|i want you to|can you please|could you please)\b/i.test(prompt);
-  const hasPotentialPII  = /\b(\d{3}[-.\s]?\d{2}[-.\s]?\d{4}|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|\b\d{16}\b)/i.test(prompt);
-  const isAmbiguous      = wordCount < 5 && !prompt.includes('?');
+    case 'optimize_prompt':
+      const optimizerModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+      const instruction = `Rewrite concisely: ${args.prompt}`;
+      const res = await optimizerModel.generateContent(instruction);
+      const optimized = res.response.text().trim();
+      return {
+        original: args.prompt,
+        optimized,
+        savings_percent: ((1 - optimized.length / args.prompt.length) * 100).toFixed(1)
+      };
 
-  const needsOptimization = len > 100 || hasRepetition || hasFillerPhrases;
-  const estimatedSavings  = needsOptimization
-    ? Math.min(65, Math.round(((len - 80) / len) * 100 + (hasRepetition ? 10 : 0) + (hasFillerPhrases ? 8 : 0)))
-    : 0;
+    case 'approve_prompt':
+      return { original: args.prompt, optimized: args.prompt, savings_percent: '0.0' };
 
-  return {
-    length:                len,
-    word_count:            wordCount,
-    sentence_count:        sentences,
-    avg_words_per_sentence: avgWPS,
-    has_repetition:        hasRepetition,
-    has_filler_phrases:    hasFillerPhrases,
-    has_potential_pii:     hasPotentialPII,
-    is_ambiguous:          isAmbiguous,
-    needs_optimization:    needsOptimization,
-    estimated_savings_pct: estimatedSavings,
-  };
-}
-
-/**
- * optimize_prompt — calls Gemini to do the actual rewrite
- */
-async function optimizePrompt({ prompt, reason }) {
-  const instruction =
-    `You are a prompt compression engine. Rewrite the prompt below to be as short as possible ` +
-    `while preserving every part of its original intent. Remove filler words, redundancy, unnecessary ` +
-    `preamble, and politeness padding. Do not add any explanation or preamble — output only the rewritten prompt.\n\n` +
-    `Prompt: ${prompt}`;
-
-  const result    = await optimizerModel.generateContent(instruction);
-  const optimized = result.response.text().trim();
-  const savings   = ((1 - optimized.length / prompt.length) * 100).toFixed(1);
-
-  return {
-    original:        prompt,
-    optimized,
-    original_length: prompt.length,
-    new_length:      optimized.length,
-    savings_percent: savings,
-    reason,
-  };
-}
-
-/**
- * approve_prompt — no transformation, just packages the pass-through
- */
-function approvePrompt({ prompt, reason }) {
-  return {
-    original:        prompt,
-    optimized:       prompt,
-    original_length: prompt.length,
-    new_length:      prompt.length,
-    savings_percent: '0.0',
-    reason,
-  };
-}
-
-/**
- * flag_prompt — flags without blocking; still returns the original prompt
- */
-function flagPrompt({ prompt, issue, severity }) {
-  return {
-    original:        prompt,
-    optimized:       prompt,
-    original_length: prompt.length,
-    new_length:      prompt.length,
-    savings_percent: '0.0',
-    flagged:         true,
-    issue,
-    severity,
-  };
-}
-
-/**
- * executeTool — dispatches to the right executor and wraps the call in an OTEL span
- */
-async function executeTool(name, args, parentSpan) {
-  const ctx       = trace.setSpan(context.active(), parentSpan);
-  const toolSpan  = tracer.startSpan(`tool.${name}`, {}, ctx);
-
-  toolSpan.setAttributes({
-    'tool.name':  name,
-    'tool.input': JSON.stringify(args).slice(0, 500),
-  });
-
-  try {
-    let result;
-    switch (name) {
-      case 'analyze_prompt':  result = analyzePrompt(args);             break;
-      case 'optimize_prompt': result = await optimizePrompt(args);      break;
-      case 'approve_prompt':  result = approvePrompt(args);             break;
-      case 'flag_prompt':     result = flagPrompt(args);                break;
-      default:                result = { error: `Unknown tool: ${name}` };
-    }
-
-    toolSpan.setAttributes({
-      'tool.output':  JSON.stringify(result).slice(0, 500),
-      'tool.success': true,
-    });
-    toolSpan.setStatus({ code: SpanStatusCode.OK });
-    return result;
-  } catch (err) {
-    toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
-    throw err;
-  } finally {
-    toolSpan.end();
+    default:
+      throw new Error(`Unknown internal tool: ${name}`);
   }
 }
 
-// ── Agent Loop ────────────────────────────────────────────────────────────────
+async function executeMCPTool(name, args) {
+  console.log(`🛠️ Calling Dynatrace MCP Tool: ${name}`);
+  const result = await mcpClient.callTool({
+    name,
+    arguments: args
+  });
+  return result.content;
+}
 
-/**
- * runAgent — the main agentic loop.
- * Sends prompt to Gemini with tools available, then keeps responding to
- * function calls until the agent reaches a terminal decision.
- */
+// ── Main Agent Loop ───────────────────────────────────────────────────────────
+
 async function runAgent(userPrompt) {
-  const agentSpan = tracer.startSpan('agent.run');
-  agentSpan.setAttributes({
-    'agent.prompt_length':  userPrompt.length,
-    'agent.prompt_preview': userPrompt.slice(0, 120),
-    'agent.model':          'gemini-1.5-flash',
+  // Combine internal tools with discovered Dynatrace tools for Gemini
+  const allTools = [
+    ...INTERNAL_TOOLS.map(t => ({ functionDeclarations: [t] })),
+    ...dynatraceTools.map(t => ({
+      functionDeclarations: [{
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema
+      }]
+    }))
+  ];
+
+  const model = genAI.getGenerativeModel({ 
+    model: 'gemini-2.0-flash',
+    tools: allTools
   });
 
-  const steps       = [];
-  let   finalResult = null;
+  const chat = model.startChat();
+  const steps = [];
+  
+  const systemPrompt = 
+    `You are Token Guard v3, an autonomous agent. Your mission is to optimize prompt costs ` +
+    `while using Dynatrace observability to monitor usage.\n\n` +
+    `PROTOCOL:\n` +
+    `1. Use analyze_prompt to check the input.\n` +
+    `2. If you need context (like current logs or budget), use Dynatrace tools like 'execute_dql'.\n` +
+    `3. Decide to optimize, approve, or flag.\n\n` +
+    `User Prompt: "${userPrompt}"`;
 
-  try {
-    const chat = agentModel.startChat();
+  let response = await chat.sendMessage(systemPrompt);
+  let iter = 0;
 
-    const systemPrompt =
-      `You are Token Guard, an autonomous AI agent that protects LLM API costs by intelligently ` +
-      `managing prompts before they reach downstream models.\n\n` +
-      `Your decision protocol:\n` +
-      `1. ALWAYS call analyze_prompt first to understand the input\n` +
-      `2. Read the analysis, then take exactly ONE terminal action:\n` +
-      `   - optimize_prompt  → if needs_optimization is true\n` +
-      `   - flag_prompt      → if has_potential_pii is true OR the prompt is dangerously ambiguous\n` +
-      `   - approve_prompt   → if the prompt is already concise and safe\n` +
-      `3. Do not call more than one terminal action. Stop after your decision.\n\n` +
-      `Process this prompt now: "${userPrompt}"`;
+  while (iter < 5) {
+    iter++;
+    const calls = response.response.functionCalls();
+    if (!calls) break;
 
-    let   response      = await chat.sendMessage(systemPrompt);
-    const MAX_ITER      = 8;
-    let   iter          = 0;
-
-    while (iter < MAX_ITER) {
-      iter++;
-      const functionCalls = response.response.functionCalls();
-
-      if (!functionCalls || functionCalls.length === 0) break; // agent done
-
-      const functionResponses = [];
-
-      for (const fc of functionCalls) {
-        const stepEntry = {
-          step:      steps.length + 1,
-          tool:      fc.name,
-          input:     fc.args,
-          timestamp: new Date().toISOString(),
-        };
-        steps.push(stepEntry);
-
-        const result   = await executeTool(fc.name, fc.args, agentSpan);
-        stepEntry.output = result;
-
-        // Capture terminal decision
-        if (['optimize_prompt', 'approve_prompt', 'flag_prompt'].includes(fc.name)) {
-          finalResult = { action: fc.name, ...result };
-        }
-
-        functionResponses.push({ functionResponse: { name: fc.name, response: result } });
+    const functionResponses = [];
+    for (const call of calls) {
+      console.log(`🏃 Step ${steps.length + 1}: ${call.name}`);
+      let result;
+      
+      if (INTERNAL_TOOLS.find(t => t.name === call.name)) {
+        result = await executeInternalTool(call.name, call.args);
+      } else {
+        result = await executeMCPTool(call.name, call.args);
       }
 
-      response = await chat.sendMessage(functionResponses);
+      steps.push({ tool: call.name, input: call.args, output: result });
+      functionResponses.push({ functionResponse: { name: call.name, response: result } });
     }
-
-    agentSpan.setAttributes({
-      'agent.steps_taken':  steps.length,
-      'agent.final_action': finalResult?.action || 'unknown',
-      'agent.savings_pct':  parseFloat(finalResult?.savings_percent || 0),
-    });
-    agentSpan.setStatus({ code: SpanStatusCode.OK });
-
-    return { steps, result: finalResult };
-  } catch (err) {
-    agentSpan.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
-    throw err;
-  } finally {
-    agentSpan.end();
+    response = await chat.sendMessage(functionResponses);
   }
+
+  const finalDecision = steps.find(s => ['optimize_prompt', 'approve_prompt'].includes(s.tool));
+  return { steps, result: finalDecision?.output || { optimized: userPrompt, savings_percent: '0.0' } };
 }
 
-// ── Dynatrace Telemetry ───────────────────────────────────────────────────────
-async function sendToDynatrace(savingsPct, originalLen, action) {
-  const base = process.env.DYNATRACE_URL;
-  if (!base) return;
+// ── Express Endpoints ─────────────────────────────────────────────────────────
 
-  const url = `${base.replace(/\/$/, '')}/api/v2/logs/ingest`;
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-  await axios.post(url, [{
-    content:  `Token Guard agent: action=${action} saved=${savingsPct}%`,
-    severity: 'info',
-    attributes: {
-      token_savings_percent: parseFloat(savingsPct),
-      original_length:       originalLen,
-      agent_action:          action,
-      'service.name':        'Token-Guard-Agent',
-    }
-  }], {
-    headers: {
-      Authorization:  `Api-Token ${process.env.DYNATRACE_API_KEY}`,
-      'Content-Type': 'application/json',
-    }
+app.post('/guard', async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+
+  try {
+    const { steps, result } = await runAgent(prompt);
+    res.json({
+      status: 'success',
+      original_length: prompt.length,
+      new_length: result.optimized?.length || prompt.length,
+      savings_percent: result.savings_percent || '0.0',
+      final_prompt: result.optimized || prompt,
+      agent_steps: steps
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Agent Error', details: err.message });
+  }
+});
+
+// ── Start Server ──────────────────────────────────────────────────────────────
+async function start() {
+  await initMCP();
+  app.listen(PORT, () => {
+    console.log(`\n🚀 Token Guard v3 LIVE on port ${PORT}`);
   });
 }
 
-// ── Express Server ────────────────────────────────────────────────────────────
-const app   = express();
-const PORT  = process.env.PORT || 3000;
-app.use(express.json());
-
-const sessionHistory = [];
-
-app.get('/',  (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
-
-// Main guard endpoint
-app.post('/guard', async (req, res) => {
-  const userPrompt = req.body.prompt;
-  console.log(`\n📥 [Agent] Prompt received — ${userPrompt?.length || 0} chars`);
-
-  if (!userPrompt) return res.status(400).json({ error: 'No prompt provided.' });
-
-  try {
-    const { steps, result } = await runAgent(userPrompt);
-    console.log(`✅ [Agent] Done in ${steps.length} steps → ${result?.action}`);
-
-    // Fire-and-forget telemetry
-    sendToDynatrace(result?.savings_percent || '0.0', userPrompt.length, result?.action)
-      .catch(e => console.error('Dynatrace error:', e.message));
-
-    sessionHistory.unshift({
-      timestamp:       new Date().toISOString(),
-      status:          result?.action || 'unknown',
-      original_length: userPrompt.length,
-      new_length:      result?.new_length || userPrompt.length,
-      savings_percent: result?.savings_percent || '0.0',
-      steps_taken:     steps.length,
-      flagged:         result?.flagged || false,
-      preview:         userPrompt.slice(0, 80) + (userPrompt.length > 80 ? '…' : ''),
-    });
-
-    res.json({
-      status:          result?.action || 'unknown',
-      original_length: userPrompt.length,
-      new_length:      result?.new_length || userPrompt.length,
-      savings_percent: result?.savings_percent || '0.0',
-      final_prompt:    result?.optimized || userPrompt,
-      flagged:         result?.flagged || false,
-      flag_issue:      result?.issue || null,
-      flag_severity:   result?.severity || null,
-      agent_steps:     steps,
-    });
-  } catch (err) {
-    console.error('❌ Agent error:', err.message);
-    res.status(500).json({ error: 'Agent failed.', detail: err.message });
-  }
-});
-
-app.get('/history',    (_req, res) => res.json(sessionHistory));
-app.delete('/history', (_req, res) => { sessionHistory.length = 0; res.json({ message: 'Cleared.' }); });
-
-app.listen(PORT, () => {
-  console.log(`\n🛡️  Token Guard Agent v2 LIVE`);
-  console.log(`🔗  Dashboard  → http://localhost:${PORT}`);
-  console.log(`🔭  Phoenix    → ${process.env.PHOENIX_COLLECTOR_ENDPOINT || 'http://localhost:6006'}`);
-  console.log(`📡  Dynatrace  → ${process.env.DYNATRACE_URL || '(not set)'}\n`);
-});
+start();
